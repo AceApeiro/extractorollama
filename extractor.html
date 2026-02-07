@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ArXiv Citation Extractor (client‑side)</title>
+<style>
+  body{font-family:Arial,Helvetica,sans-serif;background:#fafafa;color:#333;margin:0;padding:0;}
+  .wrapper{max-width:720px;margin:auto;padding:1rem;}
+  h1{font-size:1.4rem;margin-bottom:.5rem;}
+  .dropzone{
+    border:2px dashed #bbb;
+    padding:2rem;
+    text-align:center;
+    background:#fff;
+    cursor:pointer;
+    transition:background .2s,border-color .2s;
+  }
+  .dropzone.hover{border-color:#2a9d8f;background:#f0fdfa;}
+  .status{margin-top:.5rem;font-size:.9rem;color:#555;}
+  .btn{
+    display:inline-block;margin-top:.8rem;padding:.6rem 1.2rem;
+    background:#264653;color:#fff;border:none;border-radius:4px;
+    cursor:pointer;text-decoration:none;
+  }
+  .btn:disabled{background:#bbb;cursor:not-allowed;}
+  .download{margin-top:1rem;}
+</style>
+
+<!-- ---- external libraries (CDN) ---- -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.0/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/string-similarity/4.0.4/string-similarity.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/franc/6.1.0/franc.min.js"></script>
+</head>
+<body>
+<div class="wrapper">
+  <h1>ArXiv Citation Extractor (pure client‑side)</h1>
+
+  <div id="zone" class="dropzone">
+    Drag &amp; drop your <strong>.zip</strong> here<br>or click to browse
+    <input type="file" id="fileInput" accept=".zip" style="display:none">
+  </div>
+
+  <div id="status" class="status"></div>
+
+  <div id="download" class="download"></div>
+</div>
+
+<script>
+/* --------------------------------------------------------------
+   GLOBAL CONFIG & HELPERS
+   -------------------------------------------------------------- */
+const PDF_MAX_PAGES = 12;      // we only need the first few pages to find IDs/titles
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.2.67/pdf.worker.min.js';
+
+/* UI helpers -------------------------------------------------- */
+const zone   = document.getElementById('zone');
+const status = document.getElementById('status');
+const downloadDiv = document.getElementById('download');
+const fileInput = document.getElementById('fileInput');
+
+zone.onclick = () => fileInput.click();
+zone.ondragover = e => { e.preventDefault(); zone.classList.add('hover'); };
+zone.ondragleave = () => zone.classList.remove('hover');
+zone.ondrop = e => {
+  e.preventDefault(); zone.classList.remove('hover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+};
+fileInput.onchange = () => {
+  if (fileInput.files.length) handleFile(fileInput.files[0]);
+};
+
+/* --------------------------------------------------------------
+   MAIN ENTRY POINT
+   -------------------------------------------------------------- */
+async function handleFile(file){
+  if (!file.name.toLowerCase().endsWith('.zip')){
+    alert('Please upload a .zip file'); return;
+  }
+  status.textContent = `Reading ${file.name}…`;
+  downloadDiv.innerHTML = '';      // clear previous result
+
+  try{
+    const zip = await JSZip.loadAsync(file);
+    const {pdfFile, htmlFile, xmlFile, apiFile} = locateFiles(zip);
+    if (!pdfFile || !htmlFile || !xmlFile){
+      throw new Error('ZIP must contain a PDF, an HTML (or HTM) and a scraping XML.');
+    }
+
+    // ----- 1️⃣ Extract raw text from each source -----
+    const pdfText   = await extractPdfText(pdfFile);
+    const htmlText  = await zip.file(htmlFile).async('string');
+    const xmlText   = await zip.file(xmlFile).async('string');
+    const apiJson   = apiFile ? JSON.parse(await zip.file(apiFile).async('string')) : {};
+
+    // ----- 2️⃣ Parse each source into a *mini model* -----
+    const pdfInfo   = parsePdfInfo(pdfText);
+    const htmlInfo  = parseHtmlInfo(htmlText);
+    const xmlInfo   = parseXmlInfo(xmlText);
+
+    // ----- 3️⃣ Validate ID & version across the three sources -----
+    const idCheck = validateIdVersion(pdfInfo, htmlInfo, xmlInfo);
+    if (!idCheck.ok){
+      // hold‑json – user gets a tiny JSON explaining why
+      const hold = {hold_reason:idCheck.reason};
+      triggerDownload(JSON.stringify(hold, null,2), 'hold.json','application/json');
+      return;
+    }
+
+    // ----- 4️⃣ Title selection (more‑complete / semantic rules) -----
+    const title = selectTitle(pdfInfo.title, htmlInfo.title);
+
+    // ----- 5️⃣ Keywords (English‑only, proper separators) -----
+    const keywords = extractKeywords(pdfInfo.keywords || htmlInfo.keywords || '');
+
+    // ----- 6️⃣ Authors – merge PDF‑list with API‑list -----
+    const authors = mergeAuthors(pdfInfo.authors || [], apiJson.authors || []);
+
+    // ----- 7️⃣ Affiliations – normalise and split -----
+    const affiliations = normaliseAffiliations(pdfInfo.affiliations || []);
+
+    // ----- 8️⃣ Abstract (apply placeholders, API hint) -----
+    const abstract = cleanAbstract(pdfInfo.abstract || htmlInfo.abstract || '',
+                                 apiJson.abstract_hint || '');
+
+    // ----- 9️⃣ References (strip hyperlinks, split multiples) -----
+    const references = parseReferences(pdfInfo.references || '');
+
+    // ----- 🔟 Correspondence detection (asterisk, envelope, footnote) -----
+    const correspondence = detectCorrespondence(authors, pdfInfo, htmlInfo, apiJson);
+
+    // ----- 11️⃣ Build final XML ---------------------------------
+    const citationXml = buildCitationXml({
+      id: pdfInfo.arxivId,
+      version: pdfInfo.version,
+      doi: xmlInfo.doi,
+      title,
+      keywords,
+      authors,
+      affiliations,
+      abstract,
+      references,
+      correspondence
+    });
+
+    // ----- 12️⃣ Offer XML download ---------------------------------
+    triggerDownload(citationXml, 'citation.xml', 'application/xml');
+  }catch(err){
+    console.error(err);
+    status.textContent = `❌ Error: ${err.message}`;
+  }
+}
+
+/* --------------------------------------------------------------
+   1️⃣ ZIP HELPER – find the files we need
+   -------------------------------------------------------------- */
+function locateFiles(zip){
+  let pdfFile, htmlFile, xmlFile, apiFile;
+  zip.forEach((relPath, file)=> {
+    const low = relPath.toLowerCase();
+    if (low.endsWith('.pdf')   && !pdfFile)   pdfFile   = relPath;
+    if ((low.endsWith('.html') || low.endsWith('.htm')) && !htmlFile) htmlFile = relPath;
+    if (low.endsWith('.xml')   && !xmlFile)   xmlFile   = relPath;
+    if (low.endsWith('.json')  && !apiFile)   apiFile   = relPath;  // optional
+  });
+  return {pdfFile, htmlFile, xmlFile, apiFile};
+}
+
+/* --------------------------------------------------------------
+   2️⃣ PDF → plain text (first few pages only)
+   -------------------------------------------------------------- */
+async function extractPdfText(pdfFile){
+  const uint8 = await pdfFile.async('uint8array');
+  const loadingTask = pdfjsLib.getDocument({data:uint8});
+  const pdf = await loadingTask.promise;
+  const max = Math.min(pdf.numPages, PDF_MAX_PAGES);
+  let fullText = '';
+  for(let i=1;i<=max;i++){
+    const page = await pdf.getPage(i);
+    const txt = await page.getTextContent();
+    const pageStr = txt.items.map(item=>item.str).join(' ');
+    fullText += pageStr + '\n';
+  }
+  return fullText;
+}
+
+/* --------------------------------------------------------------
+   3️⃣ PARSERS – turn raw text into useful fields
+   -------------------------------------------------------------- */
+
+/* ---- PDF parser (plain text) ---- */
+function parsePdfInfo(text){
+  const lines = text.split('\n').map(l=>l.trim()).filter(l=>l);
+  const idVersion = extractIdVersion(lines);
+  const title = extractTitleFromPdf(lines);
+  const abstract = extractAbstractFromPdf(lines);
+  const keywords = extractKeywordsFromPdf(lines);
+  const authors = extractAuthorsFromPdf(lines);
+  const affiliations = extractAffiliationsFromPdf(lines);
+  const references = extractReferencesFromPdf(lines);
+  return {
+    arxivId:idVersion.id,
+    version:idVersion.version,
+    title,
+    abstract,
+    keywords,
+    authors,
+    affiliations,
+    references
+  };
+}
+
+/* ---- HTML parser (string) ---- */
+function parseHtmlInfo(htmlStr){
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(htmlStr,'text/html');
+  const text = doc.body.textContent || '';
+  const lines = text.split('\n').map(l=>l.trim()).filter(l=>l);
+  const idVersion = extractIdVersion(lines);
+  const title = doc.querySelector('title')?.textContent?.trim() || '';
+  const abstract = doc.querySelector('meta[name="citation_abstract"]')?.content ||
+                    getFirstParagraph(doc);
+  const keywords = doc.querySelector('meta[name="citation_keywords"]')?.content || '';
+  // Authors: many arXiv landing pages use meta[name="citation_author"]
+  const authorMetas = [...doc.querySelectorAll('meta[name="citation_author"]')];
+  const authors = authorMetas.map(m=>m.content.trim());
+
+  return {
+    arxivId:idVersion.id,
+    version:idVersion.version,
+    title,
+    abstract,
+    keywords,
+    authors
+  };
+}
+
+/* ---- Scraping XML parser ---- */
+function parseXmlInfo(xmlStr){
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlStr,'application/xml');
+  const arxivItem = doc.querySelector('ARXIV > item');
+  const id = arxivItem?.getAttribute('id');
+  const doi = doc.querySelector('doi')?.textContent?.trim() || '';
+  const versionEl = doc.querySelector('version');
+  const version = versionEl?.getAttribute('number')?.replace(/\[|\]/g,'') || 'v1';
+  return { arxivId:id, doi, version };
+}
+
+/* --------------------------------------------------------------
+   4️⃣ COMMON UTILITIES (ID / VERSION extraction)
+   -------------------------------------------------------------- */
+function extractIdVersion(lines){
+  const re = /arXiv[:\s]?(\d{4}\.\d{4,5})(v\d+)?/i;
+  for(const l of lines){
+    const m = re.exec(l);
+    if(m){
+      return { id:m[1], version: m[2] ? m[2].replace(/^v/,'') : '1' };
+    }
+  }
+  return {id:null, version:null};
+}
+
+/* --------------------------------------------------------------
+   5️⃣ TITLE EXTRACTOR (PDF & HTML) – “more‑complete” rule
+   -------------------------------------------------------------- */
+function extractTitleFromPdf(lines){
+  // Very naive: take the first line that looks *not* like an ID or author line
+  for(const l of lines){
+    if(l.toLowerCase().startsWith('arxiv')) continue;
+    if(l.length < 5) continue;
+    // Discard lines that are all caps & short (likely headers)
+    if(l.split(' ').length <= 2 && l===l.toUpperCase()) continue;
+    return l;
+  }
+  return '';
+}
+
+/* --------------------------------------------------------------
+   6️⃣ ABSTRACT EXTRACTOR (PDF) – grab between “Abstract” and next heading
+   -------------------------------------------------------------- */
+function extractAbstractFromPdf(lines){
+  const startIdx = lines.findIndex(l=>/^abstract[:\s]?$/i.test(l.toLowerCase()));
+  if(startIdx===-1) return '';
+  // Collect until we hit a blank line or a typical heading (e.g., “1 Introduction”)
+  let abstract = [];
+  for(let i=startIdx+1;i<lines.length;i++){
+    const l = lines[i];
+    if(l==='' || /^\d+\s+[A-Z]/.test(l)) break;
+    abstract.push(l);
+  }
+  return abstract.join(' ');
+}
+
+/* --------------------------------------------------------------
+   7️⃣ KEYWORDS (PDF) – look for a line that starts with “Keywords”
+   -------------------------------------------------------------- */
+function extractKeywordsFromPdf(lines){
+  const kwLine = lines.find(l=>/^keywords?[:\s]/i.test(l));
+  if(!kwLine) return '';
+  return kwLine.replace(/^keywords?[:\s]*/i,'').trim();
+}
+
+/* --------------------------------------------------------------
+   8️⃣ AUTHORS (PDF) – very naive extraction (comma‑separated line)
+   -------------------------------------------------------------- */
+function extractAuthorsFromPdf(lines){
+  const authLine = lines.find(l=>/^authors?[:\s]/i.test(l));
+  if(!authLine) return [];
+  const raw = authLine.replace(/^authors?[:\s]*/i,'').trim();
+  // split on commas or “and”
+  return raw.split(/,|\sand\s/).map(s=>s.trim()).filter(s=>s);
+}
+
+/* --------------------------------------------------------------
+   9️⃣ AFFILIATIONS (PDF) – collect lines that contain typical affiliation markers
+   -------------------------------------------------------------- */
+function extractAffiliationsFromPdf(lines){
+  // Look for lines that contain a university, institute, lab, etc.
+  const markers = /(university|institute|college|laboratory|dept\.|department|school|centre|center)/i;
+  return lines.filter(l=>markers.test(l));
+}
+
+/* --------------------------------------------------------------
+   🔟 REFERENCES (PDF) – everything after a “References” heading
+   -------------------------------------------------------------- */
+function extractReferencesFromPdf(lines){
+  const start = lines.findIndex(l=>/^references?$/i.test(l.toLowerCase()));
+  if(start===-1) return '';
+  return lines.slice(start+1).join(' ');
+}
+
+/* --------------------------------------------------------------
+   11️⃣ VALIDATE ID / VERSION (three sources)
+   -------------------------------------------------------------- */
+function validateIdVersion(pdf, html, xml){
+  if(!pdf.id || !html.id || !xml.arxivId){
+    return {ok:false, reason:'Missing arXiv ID in one of the sources'};
+  }
+  if(!(pdf.id===html.id && pdf.id===xml.arxivId)){
+    return {ok:false,
+            reason:`ID mismatch – PDF=${pdf.id} HTML=${html.id} XML=${xml.arxivId}`};
+  }
+  // Versions: if any source supplies a version it must agree
+  const versions = new Set([pdf.version, html.version, xml.version].filter(v=>v));
+  if(versions.size>1){
+    return {ok:false,
+            reason:`Version mismatch – PDF=${pdf.version} HTML=${html.version} XML=${xml.version}`};
+  }
+  return {ok:true, reason:null};
+}
+
+/* --------------------------------------------------------------
+   12️⃣ TITLE SELECTION – “more complete” rule + semantic exception
+   -------------------------------------------------------------- */
+function selectTitle(pdfTitle, htmlTitle){
+  const clean = s=>s.replace(/\*|Preprint/gi,'').trim();
+  const p = clean(pdfTitle||'');
+  const h = clean(htmlTitle||'');
+  if(!p) return h;
+  if(!h) return p;
+
+  // Check for *semantic* difference (simple fuzzy‑similarity)
+  const similarity = stringSimilarity.compareTwoStrings(p.toLowerCase(), h.toLowerCase());
+  if(similarity < 0.7){            // meaningfully different → prefer HTML
+    return h;
+  }
+  // Same meaning → pick longer (more complete)
+  return p.length >= h.length ? p : h;
+}
+
+/* --------------------------------------------------------------
+   13️⃣ KEYWORD PROCESSING – split on common separators, only English
+   -------------------------------------------------------------- */
+function extractKeywords(raw){
+  if(!raw) return [];
+  const cleaned = raw.replace(/keywords?\s*[:\-]?\s*/i,'');
+  const parts = cleaned.split(/[;,\u2013\u2014\-]\s*/); // ; , – — -
+  const isEnglish = w=> franc(w) === 'eng';
+  return parts.map(p=>p.trim()).filter(p=>p && isEnglish(p)).map(k=>({
+    value:k,
+    'xml:lang':'ENG',
+    original:'y'
+  }));
+}
+
+/* --------------------------------------------------------------
+   14️⃣ AUTHOR MERGE (PDF + API) – implements the 7 scenarios you described
+   -------------------------------------------------------------- */
+function mergeAuthors(pdfAuthors, apiAuthors){
+  // Helper: normalise name for comparison
+  const norm = s=>s.replace(/[.\s]/g,'').toLowerCase();
+
+  const result = [];
+  const usedApi = new Set();
+
+  // First walk through PDF list – try to match an API entry
+  pdfAuthors.forEach(pdfName=>{
+    const nPdf = norm(pdfName);
+    let match = null;
+    for(const apiObj of apiAuthors){
+      const nApi = norm(apiObj.full);
+      if(nPdf===nApi || nPdf===norm(apiObj.given) || nPdf===norm(apiObj.surname)){
+        match = apiObj; break;
+      }
+    }
+    if(match){
+      // Merge – take the more complete fields
+      const merged = {
+        full: (pdfName.length >= match.full.length) ? pdfName : match.full,
+        given: match.given || '',
+        surname: match.surname || '',
+        initials: match.initials || '',
+        degrees: match.degrees || '',
+        suffix: match.suffix || '',
+        orcid: match.orcid || '',
+        email: match.email || '',
+        alias: match.alias || ''
+      };
+      result.push(merged);
+      usedApi.add(match);
+    }else{
+      // No API counterpart → keep PDF author as‑is (will be placed after API‑only authors)
+      result.push({full:pdfName, given:'', surname:'', initials:'', degrees:'', suffix:'', orcid:'', email:'', alias:''});
+    }
+  });
+
+  // Append any API‑only authors (preserve original API order)
+  apiAuthors.forEach(a=>{ if(!usedApi.has(a)) result.push(a); });
+
+  // Assign sequence numbers (1‑based) – required for XML
+  result.forEach((a,i)=>a.seq = (i+1).toString());
+  return result;
+}
+
+/* --------------------------------------------------------------
+   15️⃣ AFFILIATION NORMALISATION (splitting into parts)
+   -------------------------------------------------------------- */
+function normaliseAffiliations(rawAffList){
+  // Very light‑weight; split on commas and try to guess parts
+  const out = [];
+  rawAffList.forEach(str=>{
+    const parts = str.split(',').map(p=>p.trim()).filter(p=>p);
+    const aff = {
+      organization: parts[0] || '',
+      'address-part': parts.slice(1,-2).join(', ') || '',
+      city: parts.slice(-2, -1)[0] || '',
+      state: parts.slice(-1)[0] || '',
+      'postal-code': '',
+      country: ''
+    };
+    out.push(aff);
+  });
+  return out;
+}
+
+/* --------------------------------------------------------------
+   16️⃣ ABSTRACT CLEANING – placeholders for formulas/figures/tables
+   -------------------------------------------------------------- */
+function cleanAbstract(raw, apiHint){
+  if(!raw) return '';
+  let txt = raw.replace(/\s+/g,' ');
+  // Replace multiline formulas (anything surrounded by $$…$$ or \[ … \])
+  txt = txt.replace(/(\$\$.*?\$\$|\\\[.*?\\\])/gs, '(Formula presented)');
+  // Replace figure/table markers (e.g., "[Figure 1]" or "Fig. 2")
+  txt = txt.replace(/\[?Figure\s*\d+?\]?/gi, '(Figure presented)');
+  txt = txt.replace(/\[?Table\s*\d+?\]?/gi,  '(Table presented)');
+
+  // Append API hint **only** if it sits on the same paragraph
+  if(apiHint){
+    // Very simple heuristic – if abstract ends with a period, attach a space
+    txt = txt.trim().replace(/\.*$/,'') + '. ' + apiHint.trim();
+  }
+  return txt;
+}
+
+/* --------------------------------------------------------------
+   17️⃣ REFERENCE PARSING – split on semicolons, strip hyperlinks
+   -------------------------------------------------------------- */
+function parseReferences(raw){
+  if(!raw) return [];
+  // Remove any URLs first
+  const noLinks = raw.replace(/https?:\/\/\S+/gi,'').trim();
+  // Split on semicolons that are not inside brackets
+  const refs = noLinks.split(/;(?![^\[]*\])/).map(r=>r.trim()).filter(r=>r);
+  return refs.map(r=>({ 'ref-fulltext': r, 'ce:source-text': r }));
+}
+
+/* --------------------------------------------------------------
+   18️⃣ CORRESPONDENCE DETECTION – asterisk / envelope markers
+   -------------------------------------------------------------- */
+function detectCorrespondence(authors, pdfInfo, htmlInfo, apiJson){
+  // Very naive: look for a star (*) or envelope (✉) next to author name in PDF text
+  const markers = new Set(['*','✉']);
+  const found = [];
+  authors.forEach(a=>{
+    // Look for “Name*” or “Name✉” in the raw PDF lines
+    const pattern = new RegExp(`${a.full.replace(/[.*+?^${}()|[\]\\]/g,'\\\\')}[\\*✉]`);
+    const hasMark = pdfInfo.rawLines?.some(l=>pattern.test(l));
+    if(hasMark){
+      found.push({author_seq:a.seq, address:'', email:a.email});
+    }
+  });
+  return found;
+}
+
+/* --------------------------------------------------------------
+   19️⃣ BUILD THE FINAL RED‑COMPATIBLE XML
+   -------------------------------------------------------------- */
+function buildCitationXml(data){
+  const NS = null; // no namespace needed for now
+
+  const doc = document.implementation.createDocument(NS,'citation',null);
+  const root = doc.documentElement;
+
+  // Helper to add simple text node
+  const add = (parent,name,val)=>{ if(!val) return; const el=doc.createElement(name); el.textContent=val; parent.appendChild(el); };
+
+  add(root,'arxiv-id',data.id);
+  add(root,'version',data.version);
+  add(root,'doi',data.doi);
+  add(root,'title',data.title);
+
+  // ----- Keywords -------------------------------------------------
+  if(data.keywords && data.keywords.length){
+    const kwEl = doc.createElement('author-keywords');
+    data.keywords.forEach(k=>{
+      const kwItem = doc.createElement('keyword');
+      kwItem.textContent = k.value;
+      kwItem.setAttribute('xml:lang',k['xml:lang']);
+      kwItem.setAttribute('original',k.original);
+      kwEl.appendChild(kwItem);
+    });
+    root.appendChild(kwEl);
+  }
+
+  // ----- Authors --------------------------------------------------
+  const agEl = doc.createElement('author-group');
+  agEl.setAttribute('seq','1');            // only one group for now
+  data.authors.forEach(a=>{
+    const auEl = doc.createElement('author');
+    auEl.setAttribute('seq',a.seq);
+    if(a.orcid) auEl.setAttribute('orcid',a.orcid);
+    if(a.initials)   { add(auEl,'ce:initials',a.initials); }
+    if(a.degrees)     { add(auEl,'ce:degrees',a.degrees); }
+    if(a.surname)     { add(auEl,'ce:surname',a.surname); }
+    if(a.given)       { add(auEl,'ce:given-name',a.given); }
+    if(a.suffix)      { add(auEl,'ce:suffix',a.suffix); }
+    if(a.email)       { add(auEl,'ce:e-address',a.email); }
+    if(a.alias)       { add(auEl,'ce:alias',a.alias); }
+    agEl.appendChild(auEl);
+  });
+  root.appendChild(agEl);
+
+  // ----- Affiliations ---------------------------------------------
+  if(data.affiliations && data.affiliations.length){
+    const affGrp = doc.createElement('affiliation-group');
+    data.affiliations.forEach((aff,i)=>{
+      const affEl = doc.createElement('affiliation');
+      affEl.setAttribute('seq',(i+1).toString());
+      if(aff.organization) add(affEl,'organization',aff.organization);
+      if(aff['address-part']) add(affEl,'address-part',aff['address-part']);
+      if(aff.city) add(affEl,'city',aff.city);
+      if(aff.state) add(affEl,'state',aff.state);
+      if(aff['postal-code']) add(affEl,'postal-code',aff['postal-code']);
+      if(aff.country) add(affEl,'country',aff.country);
+      affGrp.appendChild(affEl);
+    });
+    root.appendChild(affGrp);
+  }
+
+  // ----- Abstract -------------------------------------------------
+  add(root,'abstract',data.abstract);
+
+  // ----- References -----------------------------------------------
+  if(data.references && data.references.length){
+    const refList = doc.createElement('reference-list');
+    data.references.forEach((r,i)=>{
+      const refEl = doc.createElement('reference');
+      refEl.setAttribute('seq',(i+1).toString());
+      add(refEl,'ref-fulltext',r['ref-fulltext']);
+      add(refEl,'ce:source-text',r['ce:source-text']);
+      refList.appendChild(refEl);
+    });
+    root.appendChild(refList);
+  }
+
+  // ----- Correspondence -------------------------------------------
+  if(data.correspondence && data.correspondence.length){
+    const corr = doc.createElement('correspondence');
+    data.correspondence.forEach(c=>{
+      const person = doc.createElement('person');
+      add(person,'author-seq',c.author_seq);
+      if(c.address) add(person,'address',c.address);
+      if(c.email)   add(person,'ce:e-address',c.email);
+      corr.appendChild(person);
+    });
+    root.appendChild(corr);
+  }
+
+  // Serialize pretty‑printed XML
+  const serializer = new XMLSerializer();
+  const xmlString = serializer.serializeToString(doc);
+  // Add XML declaration and line‑breaks for readability
+  return `<?xml version="1.0" encoding="UTF-8"?>\n${xmlString}`;
+}
+
+/* --------------------------------------------------------------
+   20️⃣ TRIGGER FILE DOWNLOAD (XML or JSON)
+   -------------------------------------------------------------- */
+function triggerDownload(content, filename, mime){
+  const blob = new Blob([content],{type:mime});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.textContent = `Download ${filename}`;
+  a.className = 'btn';
+  downloadDiv.innerHTML = '';   // clear previous link
+  downloadDiv.appendChild(a);
+}
+
+/* --------------------------------------------------------------
+   END OF SCRIPT
+   -------------------------------------------------------------- */
+</script>
+</body>
+</html>
